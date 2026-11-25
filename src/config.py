@@ -44,7 +44,9 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
 
-    # Floor plan image entity (rendered from the robot's MARD room file)
+    # Floor plan image entity: drawn from the robot's floor scan file (walls,
+    # rooms, last cleaning path), or from the MARD room file without one.
+    # Captions use the TZ environment variable for local time.
     map_image: bool = True
     map_show_scan: bool = False
 

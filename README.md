@@ -214,10 +214,26 @@ An error device trigger fires when a new error is detected, usable in HA automat
 
 ### Floor plan
 
-The `image.<name>_floor_plan` entity is drawn from the room file the Shark app uses
+The `image.<name>_floor_plan` entity shows the robot's own map. When the Shark
+cloud holds a floor scan file for the robot (`Persistent_Floor_N`), it shows walls,
+room names, no-go zones, the dock and a footer saying what you are looking at:
+
+| Robot is | Picture |
+|---|---|
+| Docked | The path of the last run, with when it ended and how long it took |
+| Cleaning | The rooms being cleaned, highlighted (the old path is hidden) |
+| Just docked | "Waiting for the cleaning path"; polling stays fast for up to 3 minutes until Shark writes it |
+
+Shark does not publish a live robot position in this data, so the path appears
+after the run. The file is downloaded only when the shadow says it changed. Set the
+`TZ` environment variable (e.g. `America/New_York`) for local times in the caption.
+The file's format was worked out from UR250BEYUS and UR2360EEUS robots, so other
+models may need adjustments.
+
+Without a floor scan file, the plan is drawn from the room file the Shark app uses
 (`MARD`, which shark2mqtt already downloads for room names): each room's outline in
 its own colour, labelled with its name and area in m². Set `MAP_SHOW_SCAN=true` to
-draw the robot's own floor scan (walls and explored floor) underneath.
+draw the scan embedded in that file (if any) underneath.
 
 It's an SVG, so labels stay sharp at any size, and it's served by Home Assistant
 like any other image entity, so it's only visible to signed-in users. Show it with
@@ -230,12 +246,12 @@ show_name: false
 show_state: false
 ```
 
-The plan updates when the room file changes, i.e. after you edit rooms in the Shark
-app and shark2mqtt restarts. Currently drawn for accounts on the SharkNinja (skegox)
-API, which covers EU accounts and migrated US ones; pure-Ayla accounts don't keep
-the file around yet. The scan's cell meanings (wall, floor, unexplored) were worked
-out from RV2800ZEUK and RV2800YEUK units, so other models may shade differently.
-Set `MAP_IMAGE=false` to turn it off.
+The room-file plan updates when that file changes, i.e. after you edit rooms in the
+Shark app and shark2mqtt restarts. Both plans are drawn for accounts on the
+SharkNinja (skegox) API, which covers EU accounts and migrated US ones; pure-Ayla
+accounts don't keep the files around yet. The room file's scan cell meanings were
+worked out from RV2800ZEUK and RV2800YEUK units. Set `MAP_IMAGE=false` to turn the
+picture off.
 
 ### Vacuum States
 

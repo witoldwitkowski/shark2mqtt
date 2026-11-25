@@ -14,6 +14,7 @@ import aiomqtt
 from .ayla_api import AylaApi, MardData, debug_dump_mard_structure, parse_mard
 from .config import Settings
 from .exc import SharkAuthError
+from .floor_tracker import FloorMapTracker
 from .map_render import render_map_svg
 from .mqtt_client import MqttClient
 from .shark_auth import SharkAuth
@@ -138,6 +139,28 @@ async def _publish_floor_plan(
         logger.warning("Could not publish floor plan for %s", device.product_name, exc_info=True)
 
 
+async def _publish_floor_map(
+    mqtt: MqttClient,
+    tracker: FloorMapTracker,
+    device: SharkVacuum,
+    raw: dict[str, Any],
+) -> bool:
+    """Publish the map drawn from the robot's floor scan, if it has one.
+
+    Returns False when there is nothing to draw, so the room-file floor plan is
+    used instead. Never raises, so a map can't interrupt polling.
+    """
+    try:
+        svg = await tracker.update(device, raw)
+        if svg is None:
+            return False
+        await mqtt.publish_map(device, svg)
+    except Exception:
+        logger.warning("Could not publish the floor map for %s", device.product_name, exc_info=True)
+        return False
+    return True
+
+
 def _ayla_snd(device: SharkVacuum) -> str:
     """The skegox device ID an Ayla robot migrated to, from its battery serial.
 
@@ -221,6 +244,8 @@ async def poll_loop(
     skegox_mard_cache: dict[str, MardData] = {}
     # MARD file last rendered per device, so the plan is drawn once per file.
     rendered_maps: dict[str, bytes] = {}
+    # Walls, rooms and cleaning path from each robot's floor scan file.
+    floor_maps = FloorMapTracker(api)
     # Robots that have reported a real CleaningParameters value this session.
     wet_dry_seen: set[str] = set()
 
@@ -292,14 +317,18 @@ async def poll_loop(
                 skegox_snds.add(device.dsn)
                 devices_map[device.dsn] = device
                 await mqtt.publish_discovery(device)
-                # Floor plan from whichever MARD supplied the rooms.
-                await _publish_floor_plan(
-                    mqtt, config, device,
-                    skegox_mard if skegox_mard.rooms else ayla, rendered_maps,
-                )
+                # The floor scan gives walls and the cleaning path; without
+                # one, draw the plan from whichever MARD supplied the rooms.
+                if not (config.map_image
+                        and await _publish_floor_map(mqtt, floor_maps, device, raw)):
+                    await _publish_floor_plan(
+                        mqtt, config, device,
+                        skegox_mard if skegox_mard.rooms else ayla, rendered_maps,
+                    )
                 await mqtt.publish_state(device, prev_error=prev_errors)
                 prev_errors[device.dsn] = device.error_code
-                if device.ha_state != "docked" or device.job_active:
+                if (device.ha_state != "docked" or device.job_active
+                        or floor_maps.waiting(device.dsn)):
                     any_active = True
 
             # --- Ayla fallback (only when skegox has no devices) ---
