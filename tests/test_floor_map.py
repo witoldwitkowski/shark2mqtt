@@ -9,11 +9,13 @@ from __future__ import annotations
 import json
 import struct
 import xml.dom.minidom
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.floor_map import group_rooms, parse_floor_file, render_floor_svg
+from src.floor_map import group_rooms, parse_floor_file, render_floor_svg, rooms_on_path
+from src.floor_style import Caption, main_rooms, room_list, run_path, when
 from src.floor_tracker import (
     FloorMapTracker,
     areas_being_cleaned,
@@ -102,34 +104,79 @@ class TestParse:
         assert plan is not None and plan.path
 
 
+def draw(**kwargs):
+    caption = kwargs.pop("caption", Caption("docked", "Cleaned Den", "12 min"))
+    return render_floor_svg(parse_floor_file(floor_file()), caption, **kwargs)
+
+
 class TestDraw:
     def test_output_is_valid_svg_with_all_layers(self):
-        svg = render_floor_svg(parse_floor_file(floor_file()), "Last clean: 12 min")
+        svg = draw()
         xml.dom.minidom.parseString(svg)
-        for expected in ('class="path"', 'class="nogo"', 'class="dock"', ">Study<", ">Den<", "Last clean: 12 min"):
+        for expected in ('class="path"', 'class="swept"', 'class="nogo"', 'class="dock"', ">Study<", ">Den<",
+                         ">Cleaned Den<", ">12 min<", ">Path<", ">Cleaned<"):
             assert expected in svg
         assert 'class="cleaning"' not in svg
+
+    def test_every_map_has_the_same_width(self):
+        assert 'viewBox="0 0 1000 ' in draw()
 
     def test_grouping_rooms_are_not_labelled(self):
         plan = parse_floor_file(floor_file())
         assert group_rooms(plan.rooms) == {2}
-        assert ">Whole Floor<" not in render_floor_svg(plan, "x")
+        assert ">Whole Floor<" not in draw()
 
-    def test_highlight_without_path(self):
-        svg = render_floor_svg(parse_floor_file(floor_file()), "Cleaning Den", show_path=False, highlight=["Den"])
+    def test_cleaned_rooms_have_filled_labels(self):
+        assert draw(cleaned=["Den"]).count('class="room on"') == 1
+        assert 'class="room on"' not in draw()
+
+    def test_cleaning_without_path(self):
+        svg = draw(show_path=False, cleaning=["Den"], caption=Caption("cleaning", "Cleaning Den"))
         assert svg.count('class="cleaning"') == 1
-        assert 'class="path"' not in svg
+        assert 'class="path"' not in svg and ">Path<" not in svg
 
     def test_names_from_the_app_are_shown_and_escaped(self):
-        svg = render_floor_svg(parse_floor_file(floor_file()), "a < b", name_map={"Den": "Play & Den"},
-                               highlight=["Play & Den"])
+        svg = draw(name_map={"Den": "Play & Den"}, cleaning=["Den"], caption=Caption("docked", "a < b"))
         assert ">Play &amp; Den<" in svg and "a &lt; b" in svg and 'class="cleaning"' in svg
         xml.dom.minidom.parseString(svg)
 
     def test_columns_are_mirrored(self):
-        svg = render_floor_svg(parse_floor_file(floor_file()), "x")
+        plan = parse_floor_file(floor_file())
+        svg = render_floor_svg(plan, Caption("docked", "x"))
         # the dock is at column 4 of 40, so it is drawn near the right-hand side
-        assert f'translate({(W - 4) * 6:.1f},{4 * 6:.1f})' in svg
+        import re
+        dock = float(re.search(r'class="dock" transform="translate\(([\d.]+)', svg).group(1))
+        assert dock > 500
+
+    def test_scan_rays_outside_the_walls_are_dropped(self):
+        plan = parse_floor_file(floor_file())
+        cells = bytearray(plan.cells)
+        for col in range(10, 20):
+            cells[col] = 15  # a strip above the top wall, open on three sides
+        plan.cells = bytes(cells)
+        render_floor_svg(plan, Caption("docked", "x"))
+        assert set(plan.shapes[:W]) == {0}
+
+    def test_rooms_on_path_uses_the_smallest_room(self):
+        assert rooms_on_path(parse_floor_file(floor_file())) == ["Study"]
+
+
+class TestWords:
+    def test_room_list(self):
+        assert room_list(["A"]) == "A"
+        assert room_list(["A", "B", "C"]) == "A, B, C"
+        assert room_list(["A", "B", "C", "D"]) == "A, B + 2 more"
+
+    def test_main_rooms_ignores_rooms_passed_through(self):
+        assert main_rooms({"A": 70, "B": 25, "C": 5}, 100) == ["A", "B"]
+        assert main_rooms({"A": 5}, 100) == ["A"]
+        assert main_rooms({}, 0) == []
+
+    def test_when(self):
+        assert when(datetime(2026, 1, 1, 0, 5)) == "Thu, Jan 1 · 12:05 AM"
+
+    def test_run_path(self):
+        assert run_path(bytes([1, 1, 0, 1]), 2, 1) == "M0 0h2v1h-2zM1 1h1v1h-1z"
 
 
 def shadow(written="2026-01-01T10:00:00.000Z", areas="*"):
@@ -171,7 +218,7 @@ class TestShadowReading:
 
     def test_friendly_time(self):
         assert friendly_time("rubbish") == ""
-        assert friendly_time(OLD).startswith("Jan 1, ")
+        assert "Jan 1 · " in friendly_time(OLD)
 
 
 @pytest.mark.asyncio
@@ -186,7 +233,7 @@ class TestRun:
         api, _, tracker = self.make()
         first = await tracker.update(robot(), shadow())
         second = await tracker.update(robot(), shadow())
-        assert first == second and 'class="path"' in first and "Last clean: " in first and "12 min" in first
+        assert first == second and 'class="path"' in first and ">Cleaned Study<" in first and "12 min" in first
         assert api.fetch_property_file.await_count == 1
         api.fetch_property_file.assert_awaited_with("SND1", "Persistent_Floor_1")
 
@@ -195,18 +242,18 @@ class TestRun:
         await tracker.update(robot(), shadow())
 
         out = await tracker.update(robot("cleaning"), shadow(areas=job("Den")))
-        assert "Cleaning Den" in out and 'class="cleaning"' in out and 'class="path"' not in out
+        assert "Cleaning Den" in out and "Started " in out and 'class="cleaning"' in out and 'class="path"' not in out
 
         back = await tracker.update(robot("returning"), shadow(areas="*"))
         assert "Returning to the dock" in back and 'class="cleaning"' in back
 
         docked = await tracker.update(robot(), shadow())
-        assert "waiting for the cleaning path" in docked and 'class="path"' not in docked
+        assert "Waiting for the cleaning path" in docked and 'class="path"' not in docked
         assert tracker.waiting("SND1")
 
         now[0] = 20.0
         done = await tracker.update(robot(), shadow(NEW))
-        assert 'class="path"' in done and "Last clean: Den · " in done
+        assert 'class="path"' in done and ">Cleaned Den<" in done
         assert not tracker.waiting("SND1")
         assert api.fetch_property_file.await_count == 2
 
@@ -215,7 +262,7 @@ class TestRun:
         await tracker.update(robot(), shadow())
         await tracker.update(robot("cleaning"), shadow(areas=job("Den")))
         done = await tracker.update(robot(), shadow(NEW))
-        assert "Last clean: Den · " in done and not tracker.waiting("SND1")
+        assert ">Cleaned Den<" in done and not tracker.waiting("SND1")
 
     async def test_gives_up_waiting(self):
         _, now, tracker = self.make()
@@ -226,7 +273,7 @@ class TestRun:
         done = await tracker.update(robot(), shadow())
         assert not tracker.waiting("SND1")
         # the old path is not claimed to be of the run just finished
-        assert "Last clean: Jan 1" in done and "Den ·" not in done
+        assert ">Cleaned Study<" in done and ">Cleaned Den<" not in done
 
     async def test_charging_in_the_middle_of_a_job_counts_as_out(self):
         _, _, tracker = self.make()

@@ -20,8 +20,8 @@ Cells: 75 unexplored, 100 wall, 0 / 10 / 15 floor; anything else is drawn as a
 faint obstacle. Coordinates are metres; zero values are left out of protobuf.
 
 Columns are mirrored when drawn, which gives a true top-down view in the same
-orientation as the room file (``MARD``). Output is SVG and needs no third-party
-library, like :mod:`.map_render`.
+orientation as the room file (``MARD``). The drawing itself is in
+:mod:`.floor_style`, shared with other vacuum integrations.
 """
 
 from __future__ import annotations
@@ -31,30 +31,19 @@ import math
 import struct
 from dataclasses import dataclass, field
 from typing import Iterable
-from xml.sax.saxutils import escape
 
+from . import floor_style
 from .map_render import _centroid, _varint
 
 logger = logging.getLogger(__name__)
 
 Point = tuple[float, float]
 
-PX = 6                      # drawing units per grid cell
 UNEXPLORED = 75
 WALL = 100
 FLOOR = (0, 10, 15)
 MAX_CELLS = 4_000_000       # refuse absurd grids rather than draw them
 JUMP_M = 2.0                # a longer step in the path is a gap, not movement
-
-INK = "#16242a"
-FLOOR_COLOUR = "#e8eeec"
-WALL_COLOUR = "#35444b"
-OBSTACLE_COLOUR = "#a6b2b6"
-PATH_COLOUR = "#2168d6"
-ZONE_COLOUR = "#c23b34"
-CLEAN_FILL = "#12a594"
-CLEAN_EDGE = "#0b6e63"
-
 
 @dataclass
 class Room:
@@ -76,6 +65,7 @@ class FloorPlan:
     rooms: list[Room] = field(default_factory=list)
     zones: list[list[Point]] = field(default_factory=list)
     minutes: int = 0
+    shapes: bytes | None = field(default=None, repr=False, compare=False)  # drawing cache
 
 
 # --- protobuf ------------------------------------------------------------------
@@ -212,17 +202,18 @@ def _inside(point: Point, polygon: list[Point]) -> bool:
     return inside
 
 
+def _area(points: list[Point]) -> float:
+    return abs(sum(points[i - 1][0] * y - x * points[i - 1][1] for i, (x, y) in enumerate(points))) / 2
+
+
 def group_rooms(rooms: list[Room]) -> set[int]:
     """Indexes of rooms that span other rooms ("whole floor" areas).
 
     A room holding the centre of two or more smaller rooms is a grouping made in
     the app; labelling it would bury the labels of the rooms inside.
     """
-    def size(points: list[Point]) -> float:
-        return abs(sum(points[i - 1][0] * y - x * points[i - 1][1] for i, (x, y) in enumerate(points))) / 2
-
     centres = [_centroid(r.points) for r in rooms]
-    sizes = [size(r.points) for r in rooms]
+    sizes = [_area(r.points) for r in rooms]
     return {
         i for i, room in enumerate(rooms)
         if sum(1 for j, c in enumerate(centres)
@@ -249,153 +240,128 @@ def _label_cell(plan: FloorPlan, room: Room) -> Point:
     return min(floor, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2) if floor else (cx, cy)
 
 
+def _enclosed(plan: FloorPlan) -> bytes:
+    """Cell classes for drawing, without the scan rays that leak through windows.
+
+    Floor counts only where a wall closes it in on at least three of four sides,
+    and walls only where they border such floor.
+    """
+    w, h, cells = plan.width, plan.height, plan.cells
+    sides = bytearray(w * h)
+
+    def sweep(start: int, step: int, count: int) -> None:
+        walled, i = False, start
+        for _ in range(count):
+            value = cells[i]
+            if value == WALL:
+                walled = True
+            elif value == UNEXPLORED:
+                walled = False
+            elif walled:
+                sides[i] += 1
+            i += step
+
+    for row in range(h):
+        sweep(row * w, 1, w)
+        sweep(row * w + w - 1, -1, w)
+    for col in range(w):
+        sweep(col, w, h)
+        sweep((h - 1) * w + col, -w, h)
+
+    out = bytearray(w * h)
+    for i, value in enumerate(cells):
+        if value not in (UNEXPLORED, WALL) and sides[i] >= 3:
+            out[i] = floor_style.FLOOR if value in FLOOR else floor_style.OBSTACLE
+    for i, value in enumerate(cells):
+        if value == WALL:
+            row, col = divmod(i, w)
+            if any(out[r * w + c] in (floor_style.FLOOR, floor_style.OBSTACLE)
+                   for r in range(max(row - 2, 0), min(row + 3, h))
+                   for c in range(max(col - 2, 0), min(col + 3, w))):
+                out[i] = floor_style.WALL
+    return bytes(out)
+
+
 # --- drawing -------------------------------------------------------------------
 
-def _grid_paths(plan: FloorPlan) -> dict[str, str]:
-    """One SVG path per colour, made of horizontal runs of cells (mirrored)."""
-    paths: dict[str, list[str]] = {"floor": [], "obstacle": [], "wall": []}
-    for row in range(plan.height):
-        line = plan.cells[row * plan.width:(row + 1) * plan.width]
-        start, current = 0, None
-        for col in range(plan.width + 1):
-            if col < plan.width:
-                value = line[col]
-                kind = (None if value == UNEXPLORED else "wall" if value == WALL
-                        else "floor" if value in FLOOR else "obstacle")
-            else:
-                kind = None
-            if kind != current:
-                if current:
-                    run = col - start
-                    paths[current].append(f"M{plan.width - col} {row}h{run}v1h-{run}z")
-                start, current = col, kind
-    return {kind: "".join(parts) for kind, parts in paths.items()}
+def _scene(plan: FloorPlan, name_map: dict[str, str]) -> floor_style.Scene:
+    """The floor plan in drawing cells, mirrored to a true top-down view."""
+
+    def cell(point: Point) -> Point:
+        col = (point[0] - plan.origin[0]) / plan.resolution
+        row = (point[1] - plan.origin[1]) / plan.resolution
+        return plan.width - col, row
+
+    if plan.shapes is None:
+        shown = _enclosed(plan)
+        # mirror each row
+        plan.shapes = b"".join(shown[r * plan.width:(r + 1) * plan.width][::-1] for r in range(plan.height))
+    groups = group_rooms(plan.rooms)
+    rooms = []
+    for i, room in enumerate(plan.rooms):
+        col, row = _label_cell(plan, room)
+        corners = [cell(p) for p in room.points]
+        outline = "M" + "L".join(f"{x:.1f} {y:.1f}" for x, y in corners) + "Z"
+        rooms.append(floor_style.Room(
+            name_map.get(room.robot_name) or room.name, (plan.width - col, row), outline, i in groups))
+    return floor_style.Scene(
+        plan.width, plan.height, plan.shapes, plan.resolution, rooms=rooms,
+        zones=[[cell(p) for p in zone] for zone in plan.zones],
+        dock=cell(plan.dock) if plan.dock else None,
+    )
+
+
+def _strokes(plan: FloorPlan) -> list[list[Point]]:
+    """The path split wherever it jumps."""
+    strokes: list[list[Point]] = []
+    previous = None
+    for point in plan.path:
+        if previous is None or math.dist(point, previous) > JUMP_M:
+            strokes.append([])
+        strokes[-1].append(point)
+        previous = point
+    return strokes
+
+
+def rooms_on_path(plan: FloorPlan, name_map: dict[str, str] | None = None) -> list[str]:
+    """The rooms the recorded path was mostly in, going by the smallest room at each point."""
+    name_map = name_map or {}
+    groups = group_rooms(plan.rooms)
+    candidates = sorted((r for i, r in enumerate(plan.rooms) if i not in groups), key=lambda r: _area(r.points))
+    counts: dict[str, int] = {}
+    for point in plan.path:
+        room = next((r for r in candidates if _inside(point, r.points)), None)
+        if room:
+            name = name_map.get(room.robot_name) or room.name
+            counts[name] = counts.get(name, 0) + 1
+    return floor_style.main_rooms(counts, len(plan.path))
 
 
 def render_floor_svg(
     plan: FloorPlan,
-    caption: str,
+    caption: floor_style.Caption,
     *,
     show_path: bool = True,
-    highlight: Iterable[str] = (),
+    cleaned: Iterable[str] = (),
+    cleaning: Iterable[str] = (),
     name_map: dict[str, str] | None = None,
 ) -> str:
     """The floor plan as an SVG.
 
-    ``highlight`` holds room names (robot or display names) to mark as being
-    cleaned. ``name_map`` turns robot names into the names shown in the app.
+    ``cleaned`` and ``cleaning`` hold room names (robot or display names) of a
+    finished or running clean. ``name_map`` turns robot names into the names
+    shown in the app.
     """
     name_map = name_map or {}
-    wanted = {h.lower() for h in highlight}
-
-    def shown(room: Room) -> str:
-        return name_map.get(room.robot_name) or room.name
-
-    def to_svg(point: Point) -> Point:
-        col = (point[0] - plan.origin[0]) / plan.resolution
-        row = (point[1] - plan.origin[1]) / plan.resolution
-        return (plan.width - col) * PX, row * PX
-
-    def points_attr(points: list[Point]) -> str:
-        return " ".join("{:.1f},{:.1f}".format(*to_svg(p)) for p in points)
-
-    # frame what the robot has seen
-    seen = [i for i, v in enumerate(plan.cells) if v != UNEXPLORED]
-    if seen:
-        cols = [i % plan.width for i in seen]
-        x0, x1 = (plan.width - max(cols) - 1) * PX, (plan.width - min(cols)) * PX
-        y0, y1 = (seen[0] // plan.width) * PX, (seen[-1] // plan.width + 1) * PX
-    else:
-        x0, y0, x1, y1 = 0, 0, plan.width * PX, plan.height * PX
-    pad = 4 * PX
-    x0, y0, x1, y1 = x0 - pad, y0 - pad, x1 + pad, y1 + pad
-    width = max(x1 - x0, 600)
-    x0 -= (width - (x1 - x0)) / 2
-    font = width / 42
-    footer = font * 4.6
-    height = (y1 - y0) + footer
-
-    highlighted = [r for r in plan.rooms
-                   if r.robot_name.lower() in wanted or shown(r).lower() in wanted]
-    out = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{x0:.0f} {y0:.0f} {width:.0f} {height:.0f}" '
-        f'width="{width:.0f}" height="{height:.0f}" font-family="Helvetica Neue, Helvetica, Arial, sans-serif">',
-        f'<defs><pattern id="nogo" width="{PX * 2}" height="{PX * 2}" patternUnits="userSpaceOnUse" '
-        f'patternTransform="rotate(45)"><rect width="100%" height="100%" fill="{ZONE_COLOUR}" fill-opacity="0.10"/>'
-        f'<line x1="0" y1="0" x2="0" y2="{PX * 2}" stroke="{ZONE_COLOUR}" stroke-width="3" stroke-opacity="0.55"/>'
-        '</pattern></defs>',
-        f'<rect x="{x0:.0f}" y="{y0:.0f}" width="{width:.0f}" height="{height:.0f}" fill="#ffffff"/>',
-    ]
-    grid = _grid_paths(plan)
-    out.append(f'<g transform="scale({PX})" shape-rendering="crispEdges">'
-               f'<path d="{grid["floor"]}" fill="{FLOOR_COLOUR}"/></g>')
-    for room in highlighted:
-        out.append(f'<polygon class="cleaning" points="{points_attr(room.points)}" fill="{CLEAN_FILL}" '
-                   f'fill-opacity="0.28" stroke="{CLEAN_EDGE}" stroke-width="{PX * 0.7:.1f}" '
-                   'stroke-linejoin="round"/>')
-    out.append(f'<g transform="scale({PX})" shape-rendering="crispEdges">'
-               f'<path d="{grid["obstacle"]}" fill="{OBSTACLE_COLOUR}"/>'
-               f'<path d="{grid["wall"]}" fill="{WALL_COLOUR}"/></g>')
-    for zone in plan.zones:
-        out.append(f'<polygon class="nogo" points="{points_attr(zone)}" fill="url(#nogo)" '
-                   f'stroke="{ZONE_COLOUR}" stroke-width="{PX * 0.45:.1f}" stroke-linejoin="round"/>')
-
-    if show_path and len(plan.path) > 1:
-        commands, previous = [], None
-        for point in plan.path:
-            moved = previous is None or math.dist(point, previous) > JUMP_M
-            commands.append("{}{:.1f} {:.1f}".format("M" if moved else "L", *to_svg(point)))
-            previous = point
-        out.append(f'<path class="path" d="{"".join(commands)}" fill="none" stroke="{PATH_COLOUR}" '
-                   f'stroke-width="{max(PX * 0.5, width / 360):.1f}" stroke-linecap="round" '
-                   'stroke-linejoin="round" stroke-opacity="0.92"/>')
-
-    if plan.dock:
-        dx, dy = to_svg(plan.dock)
-        r = font * 0.62
-        out.append(f'<g class="dock" transform="translate({dx:.1f},{dy:.1f})">'
-                   f'<circle r="{r:.1f}" fill="{INK}" stroke="#ffffff" stroke-width="{r * 0.24:.1f}"/>'
-                   f'<path d="M{-r * .5:.1f} {-r * .02:.1f}L0 {-r * .5:.1f}L{r * .5:.1f} {-r * .02:.1f}'
-                   f'H{r * .33:.1f}V{r * .45:.1f}H{-r * .33:.1f}V{-r * .02:.1f}Z" fill="#ffffff"/></g>')
-
-    groups = group_rooms(plan.rooms)
-    placed: list[tuple[float, float, float]] = []
-    for i, room in enumerate(plan.rooms):
-        if i in groups:
-            continue
-        col, row = _label_cell(plan, room)
-        x, y = (plan.width - col) * PX, row * PX
-        half = len(shown(room)) * font * 0.29
-        while any(abs(x - px) < half + ph and abs(y - py) < font * 1.15 for px, py, ph in placed):
-            y += font * 1.15
-        placed.append((x, y, half))
-        weight = 700 if room in highlighted else 500
-        out.append(f'<text x="{x:.0f}" y="{y + font * 0.35:.0f}" text-anchor="middle" font-size="{font:.0f}" '
-                   f'font-weight="{weight}" fill="{INK}" stroke="#ffffff" stroke-width="{font * 0.28:.1f}" '
-                   f'stroke-linejoin="round" paint-order="stroke">{escape(shown(room))}</text>')
-
-    # footer: what the picture shows, then a key
-    left = x0 + pad
-    size = min(font * 1.3, (width - 2 * pad) / max(len(caption) * 0.58, 1))
-    out.append(f'<text class="caption" x="{left:.0f}" y="{y1 + font * 1.5:.0f}" font-size="{size:.0f}" '
-               f'font-weight="700" fill="{INK}">{escape(caption)}</text>')
-    key_y = y1 + font * 3.3
-    x = left
-    entries = []
-    if show_path and len(plan.path) > 1:
-        entries.append(("Path", f'<line x1="0" y1="0" x2="{font * 1.4:.0f}" y2="0" stroke="{PATH_COLOUR}" '
-                                f'stroke-width="{font * 0.24:.1f}" stroke-linecap="round"/>'))
-    if highlighted:
-        entries.append(("Cleaning", f'<rect y="{-font * .45:.1f}" width="{font * 1.4:.0f}" height="{font * .9:.1f}" '
-                                    f'fill="{CLEAN_FILL}" fill-opacity="0.28" stroke="{CLEAN_EDGE}" stroke-width="2"/>'))
-    if plan.zones:
-        entries.append(("No-go zone", f'<rect y="{-font * .45:.1f}" width="{font * 1.4:.0f}" height="{font * .9:.1f}" '
-                                      f'fill="url(#nogo)" stroke="{ZONE_COLOUR}" stroke-width="2"/>'))
-    if plan.dock:
-        entries.append(("Dock", f'<circle cx="{font * .7:.1f}" r="{font * .45:.1f}" fill="{INK}"/>'))
-    for label, swatch in entries:
-        out.append(f'<g transform="translate({x:.0f},{key_y:.0f})">{swatch}<text x="{font * 1.8:.0f}" '
-                   f'y="{font * 0.33:.0f}" font-size="{font * 0.92:.0f}" fill="#4a5b61">{label}</text></g>')
-        x += font * (3.2 + len(label) * 0.52)
-    out.append("</svg>")
-    return "\n".join(out)
+    scene = _scene(plan, name_map)
+    if show_path:
+        mirrored = []
+        for stroke in _strokes(plan):
+            mirrored.append([(plan.width - (x - plan.origin[0]) / plan.resolution,
+                              (y - plan.origin[1]) / plan.resolution) for x, y in stroke])
+        scene.path = mirrored
+    return floor_style.render(
+        scene, caption,
+        cleaned=[name_map.get(n, n) for n in cleaned],
+        cleaning=[name_map.get(n, n) for n in cleaning],
+    )

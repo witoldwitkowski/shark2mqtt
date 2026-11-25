@@ -16,7 +16,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
 
-from .floor_map import FloorPlan, parse_floor_file, render_floor_svg
+from .floor_map import FloorPlan, parse_floor_file, render_floor_svg, rooms_on_path
+from .floor_style import Caption, room_list, when
 from .shark_device import SharkVacuum
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,8 @@ class _Robot:
     wait_until: float | None = None
     run_rooms: list[str] = field(default_factory=list)
     run_version: Version | None = None    # the file that holds the last run seen here
+    started: datetime | None = None       # when this run was first seen, if seen starting
+    seen_docked: bool = False
 
 
 def newest_floor_file(reported: dict[str, Any]) -> Version | None:
@@ -87,13 +90,15 @@ def areas_being_cleaned(reported: dict[str, Any]) -> list[str]:
 
 
 def friendly_time(written: str) -> str:
-    """Shark's UTC timestamp in the container's time zone (set TZ), e.g. "Nov 25, 8:40 AM"."""
+    """Shark's UTC timestamp in the container's time zone (set TZ), e.g. "Wed, Nov 25 · 8:40 AM"."""
     try:
-        moment = datetime.fromisoformat(written.replace("Z", "+00:00")).astimezone()
+        return when(datetime.fromisoformat(written.replace("Z", "+00:00")).astimezone())
     except ValueError:
         return ""
-    hour = moment.hour % 12 or 12
-    return f"{moment:%b} {moment.day}, {hour}:{moment:%M} {'PM' if moment.hour >= 12 else 'AM'}"
+
+
+def clock_time(moment: datetime) -> str:
+    return when(moment).rsplit(" · ", 1)[1]
 
 
 class FloorMapTracker:
@@ -119,6 +124,9 @@ class FloorMapTracker:
         out = device.ha_state != "docked" or bool(device.job_active)
         if out and not robot.out:
             robot.before_run, robot.rooms, robot.wait_until = version, [], None
+            robot.started = datetime.now().astimezone() if robot.seen_docked else None
+        if not out:
+            robot.seen_docked = True
 
         await self._load(device, robot, version)
 
@@ -164,33 +172,45 @@ class FloorMapTracker:
         names = device.room_name_map or {}
 
         def listed(rooms: list[str]) -> str:
-            return ", ".join(names.get(r, r) for r in rooms)
+            return room_list(names.get(r, r) for r in rooms)
 
         if robot.out:
-            doing = {
+            state = {"returning": "returning", "paused": "paused", "idle": "paused",
+                     "error": "error"}.get(device.ha_state, "cleaning")
+            title = {
                 "returning": "Returning to the dock",
                 "paused": "Paused",
                 "error": "Stopped with an error",
-                "idle": "Stopped away from the dock",
             }.get(device.ha_state)
-            if doing is None:
-                doing = f"Cleaning {listed(robot.rooms)}" if robot.rooms else "Cleaning"
+            if device.ha_state == "idle":
+                title = "Stopped away from the dock"
+            if title is None:
+                title = f"Cleaning {listed(robot.rooms)}" if robot.rooms else "Cleaning"
             # a path is shown only if it was written during this run
+            new_path = robot.loaded != robot.before_run
+            detail = []
+            if state != "cleaning" and robot.rooms:
+                detail.append(listed(robot.rooms))
+            if robot.started:
+                detail.append(f"Started {clock_time(robot.started)}")
+            if not new_path:
+                detail.append("Path appears after docking")
             return render_floor_svg(
-                robot.plan, doing, show_path=robot.loaded != robot.before_run,
-                highlight=robot.rooms, name_map=names,
+                robot.plan, Caption(state, title, " · ".join(detail)), show_path=new_path,
+                cleaning=robot.rooms, name_map=names,
             )
         if robot.wait_until is not None:
             return render_floor_svg(
-                robot.plan, "Docked, waiting for the cleaning path", show_path=False,
-                highlight=robot.run_rooms, name_map=names,
+                robot.plan, Caption("waiting", "Docked", "Waiting for the cleaning path"),
+                show_path=False, cleaned=robot.run_rooms, name_map=names,
             )
-        parts = []
-        if robot.run_version == robot.loaded and robot.run_rooms:
-            parts.append(listed(robot.run_rooms))
-        if when := friendly_time(robot.loaded[1]):
-            parts.append(when)
+        rooms = robot.run_rooms if robot.run_version == robot.loaded and robot.run_rooms else None
+        rooms = rooms or rooms_on_path(robot.plan, names)
+        detail = [friendly_time(robot.loaded[1])]
         if robot.plan.minutes:
-            parts.append(f"{robot.plan.minutes} min")
-        caption = "Last clean: " + " · ".join(parts) if parts else "Last clean"
-        return render_floor_svg(robot.plan, caption, name_map=names)
+            detail.append(f"{robot.plan.minutes} min")
+        title = f"Cleaned {listed(rooms)}" if rooms else "Last clean"
+        return render_floor_svg(
+            robot.plan, Caption("docked", title, " · ".join(d for d in detail if d)),
+            cleaned=rooms, name_map=names,
+        )

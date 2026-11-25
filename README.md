@@ -220,7 +220,7 @@ room names, no-go zones, the dock and a footer saying what you are looking at:
 
 | Robot is | Picture |
 |---|---|
-| Docked | The path of the last run, with when it ended and how long it took |
+| Docked | A title naming the rooms cleaned, when the run ended and how long it took; the cleaned area shaded and the path |
 | Cleaning | The rooms being cleaned, highlighted (the old path is hidden) |
 | Just docked | "Waiting for the cleaning path"; polling stays fast for up to 3 minutes until Shark writes it |
 
