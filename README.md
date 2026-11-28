@@ -82,6 +82,7 @@ volumes:
 | `AYLA_MERGE` | No | `false` | Half-migrated accounts: also publish robots that are only on the older Ayla backend (see [#46](https://github.com/CamSoper/shark2mqtt/issues/46)) |
 | `MAP_IMAGE` | No | `true` | Publish a floor plan image entity (see [Floor plan](#floor-plan)) |
 | `MAP_SHOW_SCAN` | No | `false` | Draw the robot's floor scan (walls, explored floor) under the rooms |
+| `AREA_PICKER_ROBOTS` | No | | Comma-separated robot names or DSNs that get an area picker (see [Area picker](#area-picker)). Needs `MAP_IMAGE` |
 
 See [`config.example.env`](config.example.env) for a ready-to-edit template.
 
@@ -252,6 +253,25 @@ SharkNinja (skegox) API, which covers EU accounts and migrated US ones; pure-Ayl
 accounts don't keep the files around yet. The room file's scan cell meanings were
 worked out from RV2800ZEUK and RV2800YEUK units. Set `MAP_IMAGE=false` to turn the
 picture off.
+
+### Area picker
+
+For a robot named in `AREA_PICKER_ROBOTS`, Home Assistant gets an `Area picker` image, an `Area corners` sensor and the buttons `Clean area`, `Undo corner` and `Clear area`. Mark four corners and the robot cleans inside them, twice, the way the SharkClean app's spot clean does (mode `PinDrop`). The corners need not make a rectangle.
+
+Mark a corner with `vacuum.send_command`:
+
+```yaml
+action: vacuum.send_command
+target:
+  entity_id: vacuum.my_vacuum
+data:
+  command: area_corner
+  params: {x: 1.524, y: -3.048}   # metres on the robot's map
+```
+
+For tapping on the map, put the image in a built-in `picture-elements` card with one `icon` element per entry of the image's `tap_points` attribute; the card sends a tap to the nearest icon. A point's place in the picture comes from `position(frame, point)` in `src/area_picker.py`, using the image's `frame` attribute. The frame is saved in the token directory, so points stay put when the robot rewrites its map; delete `area_frame_<id>.json` after a re-map that outgrows it.
+
+Nothing is sent to the robot until `area_clean`, and then only if it is online and docked. An unsent shape is forgotten after ten minutes. Following a slanted edge has been seen on a UR250BEYUS; the format for robots that use `AreasToClean_V3` is untested.
 
 ### Vacuum States
 

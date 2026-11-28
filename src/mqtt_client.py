@@ -101,6 +101,57 @@ class MqttClient:
         self._map_sigs[dsn] = digest
         logger.info("Published floor plan for %s (%s), %d bytes", device.product_name, dsn, len(svg))
 
+    async def publish_area_discovery(self, device: SharkVacuum) -> None:
+        """Entities for marking an area on the map: picture, corner count and buttons."""
+        dsn = device.dsn
+        uid = f"shark2mqtt_{dsn}"
+        slug = re.sub(r"[^a-z0-9]+", "_", device.product_name.lower()).strip("_")
+        shared = {
+            "availability_topic": f"{self._prefix}/{dsn}/available",
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "device": device.device_info,
+        }
+        entities: list[tuple[str, str, dict[str, Any]]] = [
+            ("image", "area_picker", {
+                "name": "Area picker",
+                "image_topic": f"{self._prefix}/{dsn}/area_map",
+                "content_type": "image/svg+xml",
+                "json_attributes_topic": f"{self._prefix}/{dsn}/area_attributes",
+                "icon": "mdi:vector-square",
+            }),
+            ("sensor", "area_corners", {
+                "name": "Area corners",
+                "state_topic": f"{self._prefix}/{dsn}/area_corners",
+                "icon": "mdi:vector-square",
+            }),
+        ]
+        for command, name, icon in (("area_clean", "Clean area", "mdi:robot-vacuum"),
+                                    ("area_undo", "Undo corner", "mdi:undo"),
+                                    ("area_clear", "Clear area", "mdi:close-circle-outline")):
+            entities.append(("button", command, {
+                "name": name,
+                "command_topic": f"{self._prefix}/{dsn}/send_command",
+                "payload_press": json.dumps({"command": command}),
+                "icon": icon,
+            }))
+        for platform, key, config in entities:
+            await self._publish(
+                f"{HA_DISCOVERY_PREFIX}/{platform}/{uid}_{key}/config",
+                {**config, "unique_id": f"{uid}_{key}", "object_id": f"{slug}_{key}", **shared},
+                retain=True,
+            )
+        logger.info("Published area picker entities for %s (%s)", device.product_name, dsn)
+
+    async def publish_area(
+        self, device: SharkVacuum, svg: str, attributes: dict[str, Any], corners: int,
+    ) -> None:
+        """The area picker's picture, tap points and corner count."""
+        base = f"{self._prefix}/{device.dsn}"
+        await self._publish(f"{base}/area_attributes", attributes, retain=True)
+        await self._publish(f"{base}/area_map", svg, retain=True)
+        await self._publish(f"{base}/area_corners", corners, retain=True)
+
     async def publish_discovery(self, device: SharkVacuum) -> None:
         """Publish HA MQTT autodiscovery configs for a vacuum and its sensors."""
         dsn = device.dsn
@@ -653,6 +704,7 @@ class MqttClient:
         command_handler: Any,
         devices: dict[str, SharkVacuum],
         command_event: asyncio.Event | None = None,
+        area_picker: Any = None,
     ) -> None:
         """Subscribe to command topics and dispatch via handler.
 
@@ -697,6 +749,12 @@ class MqttClient:
                     self._water_flow_overrides[device_id] = level
                     await command_handler.set_water_flow(device_id, level)
                 elif topic.endswith("/send_command"):
+                    name, params = self._parse_command(payload)
+                    if area_picker is not None and name.startswith("area_"):
+                        # marking corners changes nothing on the robot: don't poll for it
+                        if await area_picker.handle(device_id, name, params) and command_event is not None:
+                            command_event.set()
+                        continue
                     logger.info("send_command received for %s", device_id)
                     await self._handle_send_command(
                         command_handler, device_id, payload, devices,
@@ -778,20 +836,8 @@ class MqttClient:
         )
 
     @staticmethod
-    async def _handle_send_command(
-        handler: Any, device_id: str, payload: str,
-        devices: dict[str, Any],
-    ) -> None:
-        """Handle vacuum.send_command from HA.
-
-        HA publishes JSON: {"command": "...", "params": {...}}
-
-        Supported commands:
-          clean_room:    {room: "Kitchen"}
-          matrix_clean:  {room: "Kitchen"}
-          clean_rooms:   {rooms: ["Kitchen", "Den"], mode: "UserRoom",
-                          clean_count: 1, clean_type: "dry"}
-        """
+    def _parse_command(payload: str) -> tuple[str, dict[str, Any]]:
+        """The command and parameters of a send_command payload."""
         import json as _json
         # HA may publish the command as raw JSON ({"command": "..."}) or as a
         # plain command string (e.g. "vacuum_and_mop"). Accept both.
@@ -818,6 +864,24 @@ class MqttClient:
         for key, val in data.items():
             if key not in ("command", "params", "param") and key not in params:
                 params[key] = val
+        return str(command), params
+
+    @staticmethod
+    async def _handle_send_command(
+        handler: Any, device_id: str, payload: str,
+        devices: dict[str, Any],
+    ) -> None:
+        """Handle vacuum.send_command from HA.
+
+        HA publishes JSON: {"command": "...", "params": {...}}
+
+        Supported commands:
+          clean_room:    {room: "Kitchen"}
+          matrix_clean:  {room: "Kitchen"}
+          clean_rooms:   {rooms: ["Kitchen", "Den"], mode: "UserRoom",
+                          clean_count: 1, clean_type: "dry"}
+        """
+        command, params = MqttClient._parse_command(payload)
 
         # Get device attributes
         device = devices.get(device_id)

@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     map_image: bool = True
     map_show_scan: bool = False
 
+    # Robots (comma-separated names or DSNs) that get an area picker: tap four
+    # corners on the map in HA and clean inside them. Empty: off. Needs MAP_IMAGE.
+    area_picker_robots: str = ""
+
     # Also publish Ayla-only robots on accounts where skegox has others
     # (half-migrated accounts, issue #46). Off by default.
     ayla_merge: bool = False

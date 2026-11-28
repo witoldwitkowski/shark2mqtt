@@ -12,7 +12,8 @@ observed on UR250BEYUS and UR2360EEUS robots (inferred, not documented by Shark)
 8    path of the last run: {1: metres per unit, 2: 2, 3: little-endian int16
      x, y pairs}
 11   last run: {1: start time, 2: minutes}
-15   rooms: {2: robot name, 3: name, 4: {1: [{1: x, 2: y}, ...]}}
+15   rooms: {2: robot name, 3: name, 4: {1: [{1: x, 2: y}, ...]}}; one named
+     ``PinDrop`` holds the corners of the last marked area (spot clean)
 16   no-go zones: {4: polygon, as for rooms}
 ==== =========================================================================
 
@@ -44,6 +45,7 @@ WALL = 100
 FLOOR = (0, 10, 15)
 MAX_CELLS = 4_000_000       # refuse absurd grids rather than draw them
 JUMP_M = 2.0                # a longer step in the path is a gap, not movement
+AREA_ROOM = "PinDrop"       # the "room" a spot or marked-area clean is stored as
 
 @dataclass
 class Room:
@@ -64,6 +66,7 @@ class FloorPlan:
     path: list[Point] = field(default_factory=list)
     rooms: list[Room] = field(default_factory=list)
     zones: list[list[Point]] = field(default_factory=list)
+    area: list[Point] = field(default_factory=list)     # corners of the last marked area
     minutes: int = 0
     shapes: bytes | None = field(default=None, repr=False, compare=False)  # drawing cache
 
@@ -170,6 +173,10 @@ def parse_floor_file(body: bytes) -> FloorPlan | None:
             points = _polygon(entry)
             robot_name = _text(entry, 2)
             name = _text(entry, 3) or robot_name
+            if robot_name == AREA_ROOM:
+                if len(points) >= 3:
+                    plan.area = points
+                continue
             if name and len(points) >= 3:
                 plan.rooms.append(Room(robot_name or name, name, points))
 
@@ -284,6 +291,26 @@ def _enclosed(plan: FloorPlan) -> bytes:
 
 # --- drawing -------------------------------------------------------------------
 
+def path_share_in_area(plan: FloorPlan, margin: float = 0.3) -> float:
+    """How much of the recorded path lies in (or within ``margin`` of) the last marked area."""
+    if not (plan.area and plan.path):
+        return 0.0
+
+    def near(point: Point) -> bool:
+        if _inside(point, plan.area):
+            return True
+        for i, (bx, by) in enumerate(plan.area):
+            ax, ay = plan.area[i - 1]
+            dx, dy = bx - ax, by - ay
+            length = dx * dx + dy * dy
+            t = 0.0 if not length else max(0.0, min(1.0, ((point[0] - ax) * dx + (point[1] - ay) * dy) / length))
+            if math.hypot(point[0] - ax - t * dx, point[1] - ay - t * dy) <= margin:
+                return True
+        return False
+
+    return sum(near(p) for p in plan.path) / len(plan.path)
+
+
 def _scene(plan: FloorPlan, name_map: dict[str, str]) -> floor_style.Scene:
     """The floor plan in drawing cells, mirrored to a true top-down view."""
 
@@ -345,15 +372,30 @@ def render_floor_svg(
     cleaned: Iterable[str] = (),
     cleaning: Iterable[str] = (),
     name_map: dict[str, str] | None = None,
+    area: Iterable[Point] = (),
+    corners: Iterable[Point] = (),
+    frame: tuple[float, float, float, float] | None = None,
 ) -> str:
     """The floor plan as an SVG.
 
     ``cleaned`` and ``cleaning`` hold room names (robot or display names) of a
     finished or running clean. ``name_map`` turns robot names into the names
-    shown in the app.
+    shown in the app. ``area`` outlines a marked area and ``corners`` numbers
+    points, both in map metres; ``frame`` (x0, y0, x1, y1 in metres) fixes what
+    part of the map is shown, so positions in the picture stay put.
     """
     name_map = name_map or {}
     scene = _scene(plan, name_map)
+
+    def mirrored_cell(point: Point) -> Point:
+        return (plan.width - (point[0] - plan.origin[0]) / plan.resolution,
+                (point[1] - plan.origin[1]) / plan.resolution)
+
+    scene.area = [mirrored_cell(p) for p in area]
+    scene.corners = [mirrored_cell(p) for p in corners]
+    if frame:
+        (left, top), (right, bottom) = mirrored_cell((frame[2], frame[1])), mirrored_cell((frame[0], frame[3]))
+        scene.frame = (left, top, right, bottom)
     if show_path:
         mirrored = []
         for stroke in _strokes(plan):

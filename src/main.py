@@ -14,6 +14,7 @@ import aiomqtt
 from .ayla_api import AylaApi, MardData, debug_dump_mard_structure, parse_mard
 from .config import Settings
 from .exc import SharkAuthError
+from .area_picker import AreaPicker
 from .floor_tracker import FloorMapTracker
 from .map_render import render_map_svg
 from .mqtt_client import MqttClient
@@ -234,6 +235,7 @@ async def poll_loop(
     ayla_room_data: dict[str, tuple[str, list[str]]],
     ayla_mard: dict[str, MardData],
     command_event: asyncio.Event,
+    area_picker: AreaPicker | None = None,
 ) -> None:
     """Periodically poll device state and publish to MQTT."""
     prev_errors: dict[str, int] = {}
@@ -325,6 +327,12 @@ async def poll_loop(
                         mqtt, config, device,
                         skegox_mard if skegox_mard.rooms else ayla, rendered_maps,
                     )
+                if area_picker is not None:
+                    try:
+                        await area_picker.refresh(device, floor_maps.plan_for(device.dsn))
+                    except Exception:
+                        logger.warning("Could not update the area picker for %s",
+                                       device.product_name, exc_info=True)
                 await mqtt.publish_state(device, prev_error=prev_errors)
                 prev_errors[device.dsn] = device.error_code
                 if (device.ha_state != "docked" or device.job_active
@@ -477,10 +485,11 @@ async def run(config: Settings) -> None:
             await mqtt.publish_status({"state": "online"})
 
             command_event = asyncio.Event()
+            area_picker = AreaPicker(config, api, mqtt) if config.area_picker_robots else None
 
             async with asyncio.TaskGroup() as tg:
-                tg.create_task(poll_loop(api, ayla_api, mqtt, auth, config, devices_map, ayla_room_data, ayla_mard, command_event))
-                tg.create_task(mqtt.command_listener(router, devices_map, command_event))
+                tg.create_task(poll_loop(api, ayla_api, mqtt, auth, config, devices_map, ayla_room_data, ayla_mard, command_event, area_picker))
+                tg.create_task(mqtt.command_listener(router, devices_map, command_event, area_picker))
 
                 async def _shutdown_watcher() -> None:
                     await stop_event.wait()

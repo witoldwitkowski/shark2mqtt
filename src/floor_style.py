@@ -73,6 +73,9 @@ class Scene:
     trail: list[Point] = field(default_factory=list)            # estimated route
     samples: list[Point] = field(default_factory=list)          # positions reported
     robot: Point | None = None
+    frame: tuple[float, float, float, float] | None = None      # show exactly this x0, y0, x1, y1
+    area: list[Point] = field(default_factory=list)             # outline of a marked area
+    corners: list[Point] = field(default_factory=list)          # numbered markers, in order
 
 
 @dataclass
@@ -127,6 +130,15 @@ def text_width(text: str, size: float, bold: bool = True) -> float:
         else:
             units += 0.56
     return units * size * (1.04 if bold else 1.0)
+
+
+def layout(width: float, height: float) -> tuple[float, float, float, float]:
+    """Where a plan of this size (in any unit) goes: scale, left, top and picture height."""
+    scale = min(MAP_WIDTH / width, MAP_MAX_HEIGHT / height)
+    area_height = max(height * scale, MAP_MIN_HEIGHT)
+    left = (WIDTH - width * scale) / 2
+    top = HEADER + (area_height - height * scale) / 2
+    return scale, left, top, HEADER + area_height + 54 + 44
 
 
 # --- grid ----------------------------------------------------------------------
@@ -200,14 +212,11 @@ def render(
     """
     cleaned = {name.lower() for name in cleaned}
     cleaning = {name.lower() for name in cleaning}
-    x0, y0, x1, y1 = _extent(scene)
-    scale = min(MAP_WIDTH / (x1 - x0), MAP_MAX_HEIGHT / (y1 - y0))
-    map_height = (y1 - y0) * scale
-    area_height = max(map_height, MAP_MIN_HEIGHT)
-    ox = (WIDTH - (x1 - x0) * scale) / 2 - x0 * scale
-    oy = HEADER + (area_height - map_height) / 2 - y0 * scale
-    key_y = HEADER + area_height + 54
-    height = key_y + 44
+    x0, y0, x1, y1 = scene.frame or _extent(scene)
+    scale, left, top, height = layout(x1 - x0, y1 - y0)
+    ox = left - x0 * scale
+    oy = top - y0 * scale
+    key_y = height - 44
 
     def at(point: Point) -> Point:
         return ox + point[0] * scale, oy + point[1] * scale
@@ -243,6 +252,8 @@ def render(
         f'patternTransform="rotate(45)"><rect width="100%" height="100%" fill="{NO_GO}" fill-opacity="0.08"/>'
         f'<rect width="{unit(4):.2f}" height="100%" fill="{NO_GO}" fill-opacity="0.4"/></pattern>',
         f'<clipPath id="floor"><path d="{floor}{obstacles}"/></clipPath>',
+        (f'<clipPath id="frame"><rect x="{x0:.2f}" y="{y0:.2f}" width="{x1 - x0:.2f}" height="{y1 - y0:.2f}"/>'
+         '</clipPath>' if scene.frame else ""),
         '</defs>',
         f'<rect width="100%" height="100%" fill="{PAGE}"/>',
         # header
@@ -259,7 +270,8 @@ def render(
                    f'{escape(caption.detail)}</text>')
 
     # floor plan
-    out.append(f'<g class="plan" transform="translate({ox:.2f} {oy:.2f}) scale({scale:.4f})">')
+    clip = ' clip-path="url(#frame)"' if scene.frame else ""
+    out.append(f'<g class="plan" transform="translate({ox:.2f} {oy:.2f}) scale({scale:.4f})"{clip}>')
     out.append(f'<path d="{floor}{obstacles}" fill="{FLOOR_COLOUR}" filter="url(#soft)"/>')
     for room in marked:
         # clipped to the floor: a room's outline is a rough box that can reach past its walls
@@ -283,6 +295,10 @@ def render(
     for barrier in scene.barriers:
         out.append(f'<polyline class="nogo" points="{_points(barrier)}" fill="none" stroke="{NO_GO}" '
                    f'stroke-width="{unit(5):.2f}" stroke-linecap="round"/>')
+    if len(scene.area) > 2:
+        out.append(f'<polygon class="area" points="{_points(scene.area)}" fill="{SWEPT}" fill-opacity="0.22" '
+                   f'stroke="{ACCENT}" stroke-width="{unit(4):.2f}" '
+                   f'stroke-dasharray="{unit(12):.2f} {unit(8):.2f}" stroke-linejoin="round"/>')
     if strokes:
         out.append(f'<path class="path" d="{"".join(_line(s) for s in strokes)}" fill="none" stroke="{ACCENT}" '
                    f'stroke-width="{unit(2.4):.2f}" stroke-linecap="round" stroke-linejoin="round"/>')
@@ -330,6 +346,16 @@ def render(
                    f'<text x="{x:.1f}" y="{y + size * 0.35:.1f}" text-anchor="middle" font-size="{size:.0f}" '
                    f'font-weight="600" fill="{text}">{escape(room.name)}</text></g>')
 
+    # marked corners go over the names, so every one can be seen
+    marks = [at(point) for point in scene.corners]
+    if 1 < len(marks) and len(scene.area) < 3:
+        out.append(f'<polyline class="edges" points="{_points(marks)}" fill="none" stroke="{ACCENT}" '
+                   'stroke-width="4" stroke-dasharray="12 8" stroke-linejoin="round"/>')
+    for number, (x, y) in enumerate(marks, 1):
+        out.append(f'<g class="corner"><circle cx="{x:.1f}" cy="{y:.1f}" r="17" fill="{ACCENT}" stroke="{PAGE}" '
+                   f'stroke-width="4"/><text x="{x:.1f}" y="{y + 8:.1f}" text-anchor="middle" font-size="22" '
+                   f'font-weight="700" fill="{PAGE}">{number}</text></g>')
+
     # key: only what is in the picture
     entries: list[tuple[str, str]] = []
     if has_swept:
@@ -340,6 +366,9 @@ def render(
     if marked:
         entries.append(("Cleaning", f'<rect y="-12" width="34" height="24" rx="5" fill="{SWEPT}" fill-opacity="0.24" '
                                     f'stroke="{ACCENT}" stroke-width="2.5" stroke-dasharray="7 5"/>'))
+    if len(scene.area) > 2:
+        entries.append(("Area", f'<rect y="-12" width="34" height="24" rx="5" fill="{SWEPT}" fill-opacity="0.22" '
+                                f'stroke="{ACCENT}" stroke-width="2.5" stroke-dasharray="7 5"/>'))
     if scene.robot:
         entries.append(("Vacuum", _robot(17, 0, 11).replace('class="pulse" ', "")))
     if len(scene.trail) > 1:

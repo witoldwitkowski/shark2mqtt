@@ -16,7 +16,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
 
-from .floor_map import FloorPlan, parse_floor_file, render_floor_svg, rooms_on_path
+from .floor_map import (
+    AREA_ROOM,
+    FloorPlan,
+    parse_floor_file,
+    path_share_in_area,
+    render_floor_svg,
+    rooms_on_path,
+)
 from .floor_style import Caption, room_list, when
 from .shark_device import SharkVacuum
 
@@ -25,6 +32,8 @@ logger = logging.getLogger(__name__)
 FLOOR_FILE = re.compile(r"^Persistent_Floor_\d+$")
 WAIT_FOR_PATH_SECONDS = 180   # how long to keep polling fast after a run
 MAX_ATTEMPTS = 3              # tries per version of a floor file
+AREA_NAME = "a marked area"   # what a spot or marked-area clean is called
+AREA_SHARE = 0.5              # this much of a path in the area marks a run not seen from here
 
 Version = tuple[str, str]     # (property name, time Shark wrote it)
 
@@ -43,6 +52,8 @@ class _Robot:
     run_version: Version | None = None    # the file that holds the last run seen here
     started: datetime | None = None       # when this run was first seen, if seen starting
     seen_docked: bool = False
+    area: list[tuple[float, float]] = field(default_factory=list)       # marked area of this run
+    run_area: list[tuple[float, float]] = field(default_factory=list)   # ... of the last one
 
 
 def newest_floor_file(reported: dict[str, Any]) -> Version | None:
@@ -65,8 +76,8 @@ def newest_floor_file(reported: dict[str, Any]) -> Version | None:
     return name, written
 
 
-def areas_being_cleaned(reported: dict[str, Any]) -> list[str]:
-    """Room names in the current job; empty when idle or cleaning everywhere."""
+def _jobs(reported: dict[str, Any]) -> list[tuple[str, str]]:
+    """(mode, room) for each entry of the current job."""
     for key in ("AreasToClean_V3", "AreasToClean_V2"):
         entry = reported.get(key)
         value = entry.get("value") if isinstance(entry, dict) else entry
@@ -80,12 +91,37 @@ def areas_being_cleaned(reported: dict[str, Any]) -> list[str]:
         # V2: {"areas_to_clean": ["UserRoom:Kitchen"]}
         # V3: {"areas_to_clean": {"UserRoom": ["Kitchen"]}}
         areas = value.get("areas_to_clean")
+        jobs: list[tuple[str, str]] = []
         if isinstance(areas, dict):
-            areas = [a for group in areas.values() if isinstance(group, list) for a in group]
-        if isinstance(areas, list):
-            names = [a.split(":", 1)[-1] for a in areas if isinstance(a, str) and a not in ("", "*")]
-            if names:
-                return names
+            jobs = [(str(mode), a) for mode, group in areas.items() if isinstance(group, list)
+                    for a in group if isinstance(a, str)]
+        elif isinstance(areas, list):
+            for a in areas:
+                if isinstance(a, str):
+                    mode, colon, room = a.partition(":")
+                    jobs.append((mode, room) if colon else ("", a))
+        jobs = [(mode, room) for mode, room in jobs if room not in ("", "*")]
+        if jobs:
+            return jobs
+    return []
+
+
+def areas_being_cleaned(reported: dict[str, Any]) -> list[str]:
+    """Room names in the current job; empty when idle or cleaning everywhere."""
+    names = [AREA_NAME if mode == AREA_ROOM else room for mode, room in _jobs(reported)]
+    return list(dict.fromkeys(names))
+
+
+def area_being_cleaned(reported: dict[str, Any]) -> list[tuple[float, float]]:
+    """Corners (map metres) of the marked area in the current job, if it is one."""
+    for mode, room in _jobs(reported):
+        if mode == AREA_ROOM:
+            try:
+                numbers = [float(v) for v in room.split(",")]
+            except ValueError:
+                return []
+            if len(numbers) >= 6 and len(numbers) % 2 == 0:
+                return list(zip(numbers[::2], numbers[1::2]))
     return []
 
 
@@ -114,6 +150,11 @@ class FloorMapTracker:
         robot = self._robots.get(dsn)
         return bool(robot and robot.wait_until is not None and self._clock() < robot.wait_until)
 
+    def plan_for(self, dsn: str) -> FloorPlan | None:
+        """The floor plan last read for a robot."""
+        robot = self._robots.get(dsn)
+        return robot.plan if robot else None
+
     async def update(self, device: SharkVacuum, raw: dict[str, Any]) -> str | None:
         """The SVG to show for this poll, or None if there is no floor file to draw."""
         reported = ((raw.get("shadow") or {}).get("properties") or {}).get("reported") or {}
@@ -124,6 +165,7 @@ class FloorMapTracker:
         out = device.ha_state != "docked" or bool(device.job_active)
         if out and not robot.out:
             robot.before_run, robot.rooms, robot.wait_until = version, [], None
+            robot.area = []
             robot.started = datetime.now().astimezone() if robot.seen_docked else None
         if not out:
             robot.seen_docked = True
@@ -134,8 +176,10 @@ class FloorMapTracker:
             for name in areas_being_cleaned(reported):
                 if name not in robot.rooms:
                     robot.rooms.append(name)
+            robot.area = area_being_cleaned(reported) or robot.area
         elif robot.out:  # the run just ended
             robot.run_rooms, robot.run_version = robot.rooms, None
+            robot.run_area = robot.area
             robot.wait_until = self._clock() + WAIT_FOR_PATH_SECONDS
         robot.out = out
 
@@ -197,20 +241,28 @@ class FloorMapTracker:
                 detail.append("Path appears after docking")
             return render_floor_svg(
                 robot.plan, Caption(state, title, " · ".join(detail)), show_path=new_path,
-                cleaning=robot.rooms, name_map=names,
+                cleaning=robot.rooms, name_map=names, area=robot.area,
             )
         if robot.wait_until is not None:
             return render_floor_svg(
                 robot.plan, Caption("waiting", "Docked", "Waiting for the cleaning path"),
-                show_path=False, cleaned=robot.run_rooms, name_map=names,
+                show_path=False, cleaned=robot.run_rooms, name_map=names, area=robot.run_area,
             )
-        rooms = robot.run_rooms if robot.run_version == robot.loaded and robot.run_rooms else None
-        rooms = rooms or rooms_on_path(robot.plan, names)
+        seen = robot.run_version == robot.loaded and bool(robot.run_rooms)
+        area: list[tuple[float, float]] = []
+        if seen and AREA_NAME in robot.run_rooms:
+            area = robot.run_area or robot.plan.area
+        elif not seen and path_share_in_area(robot.plan) >= AREA_SHARE:
+            area = robot.plan.area
+        if seen:
+            rooms = robot.run_rooms
+        else:
+            rooms = [AREA_NAME] if area else rooms_on_path(robot.plan, names)
         detail = [friendly_time(robot.loaded[1])]
         if robot.plan.minutes:
             detail.append(f"{robot.plan.minutes} min")
         title = f"Cleaned {listed(rooms)}" if rooms else "Last clean"
         return render_floor_svg(
             robot.plan, Caption("docked", title, " · ".join(d for d in detail if d)),
-            cleaned=rooms, name_map=names,
+            cleaned=rooms, name_map=names, area=area,
         )
